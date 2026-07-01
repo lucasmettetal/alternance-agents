@@ -1,35 +1,57 @@
 """
-Envoie une entreprise à Ollama et retourne un score d'attractivité alternance.
+Envoie une entreprise à Ollama et retourne un score d'attractivité alternance,
+enrichi d'une analyse CV-match (profil Lucas vs entreprise).
 """
 
 import json
 import re
 from litellm import completion
+from cv_profile import get_profile, profile_summary
 
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "ollama/llama3.2"
+OLLAMA_MODEL    = "ollama/llama3.2"
 
-PROMPT_TEMPLATE = """Tu es un conseiller en orientation pour étudiants en BTS SIO.
-Analyse cette entreprise et évalue sa probabilité d'accueillir un alternant en informatique
-(support IT, helpdesk, technicien réseaux, administration systèmes, cybersécurité débutant).
+_PROMPT = """Tu es un conseiller en orientation pour BTS SIO SISR.
+{profil_context}
+
+Analyse cette entreprise et évalue son adéquation avec ce profil.
 
 Entreprise : {nom}
 Activité NAF : {naf} – {activite}
 Ville : {ville} ({code_postal})
 Effectif : {effectif}
 
-Réponds UNIQUEMENT en JSON valide, sans texte autour :
-{{"score": <entier de 0 à 10>, "raison": "<une phrase courte>"}}
+Réponds UNIQUEMENT avec ce JSON (sans markdown, sans texte autour) :
+{{
+  "score": 7,
+  "raison": "justification courte de l'adéquation globale",
+  "cv_match_score": 6,
+  "cv_match_reason": "correspondance avec le profil : points forts et points faibles",
+  "company_type": "ESN",
+  "mission_probable": "ce qu'un alternant IT ferait probablement ici",
+  "interet_pour_lucas": "élevé",
+  "risque": "principal point de vigilance"
+}}
 
-Score 0 = aucun lien avec l'IT / Score 10 = entreprise IT idéale pour alternance."""
+Règles :
+- score et cv_match_score sont des entiers 0-10
+- company_type : ESN / infogérance / dépannage PC / cloud / hébergement / industrie / DSI / commerce / autre
+- interet_pour_lucas : élevé / moyen / faible
+- Dépannage PC particuliers ou réparation basique → cv_match_score bas (≤3), interet_pour_lucas=faible
+- ESN, infogérance, DSI, cloud, réseaux → cv_match_score élevé si activité correspond au profil"""
 
 
 def score_company(company: dict, model: str = OLLAMA_MODEL, base_url: str = OLLAMA_BASE_URL) -> dict:
     """
-    Retourne le dict company enrichi de 'score' (int) et 'raison' (str).
-    En cas d'échec, score = -1 et raison = message d'erreur.
+    Enrichit le dict company avec :
+    score, raison, cv_match_score, cv_match_reason,
+    company_type, mission_probable, interet_pour_lucas, risque,
+    json_valide, reponse_brute, erreur_parsing.
     """
-    prompt = PROMPT_TEMPLATE.format(
+    profile = get_profile()
+
+    prompt = _PROMPT.format(
+        profil_context=profile_summary(profile),
         nom=company.get("nom", ""),
         naf=company.get("naf", ""),
         activite=company.get("activite", ""),
@@ -38,6 +60,7 @@ def score_company(company: dict, model: str = OLLAMA_MODEL, base_url: str = OLLA
         effectif=company.get("effectif", "inconnu"),
     )
 
+    raw = ""
     try:
         response = completion(
             model=model,
@@ -45,25 +68,59 @@ def score_company(company: dict, model: str = OLLAMA_MODEL, base_url: str = OLLA
             api_base=base_url,
         )
         raw = response["choices"][0]["message"]["content"].strip()
-        data = _parse_json(raw)
-        company["score"] = int(data.get("score", -1))
-        company["raison"] = data.get("raison", "")
     except Exception as e:
-        company["score"] = -1
-        company["raison"] = f"Erreur: {e}"
+        company.update({
+            "score": -1, "raison": "",
+            "cv_match_score": -1, "cv_match_reason": "",
+            "company_type": "", "mission_probable": "",
+            "interet_pour_lucas": "", "risque": "",
+            "json_valide": False, "reponse_brute": "",
+            "erreur_parsing": f"Erreur Ollama : {e}",
+        })
+        return company
 
+    data, erreur = _parse_json(raw)
+
+    company.update({
+        "score":              _safe_int(data.get("score", -1)),
+        "raison":             data.get("raison", ""),
+        "cv_match_score":     _safe_int(data.get("cv_match_score", -1)),
+        "cv_match_reason":    data.get("cv_match_reason", ""),
+        "company_type":       data.get("company_type", ""),
+        "mission_probable":   data.get("mission_probable", ""),
+        "interet_pour_lucas": data.get("interet_pour_lucas", ""),
+        "risque":             data.get("risque", ""),
+        "json_valide":        erreur is None,
+        "reponse_brute":      raw,
+        "erreur_parsing":     erreur or "",
+    })
     return company
 
 
-def _parse_json(text: str) -> dict:
-    """Extrait le premier bloc JSON de la réponse même si Ollama ajoute du texte."""
-    # Tentative directe
+def _safe_int(val) -> int:
     try:
-        return json.loads(text)
+        return int(val)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _parse_json(text: str) -> tuple[dict, str | None]:
+    try:
+        return json.loads(text), None
     except json.JSONDecodeError:
         pass
-    # Extraction par regex si le modèle ajoute du texte autour
-    match = re.search(r'\{.*?\}', text, re.DOTALL)
+
+    stripped = re.sub(r"```(?:json)?\s*|\s*```", "", text).strip()
+    try:
+        return json.loads(stripped), None
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
-        return json.loads(match.group())
-    raise ValueError(f"Pas de JSON valide dans : {text[:200]}")
+        try:
+            return json.loads(match.group()), None
+        except json.JSONDecodeError as e:
+            return {}, f"JSON malformé : {e} | extrait : {match.group()[:100]}"
+
+    return {}, f"Aucun bloc JSON trouvé dans : {text[:200]}"
