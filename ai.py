@@ -11,7 +11,7 @@ from cv_profile import get_profile, profile_summary
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL    = "ollama/llama3.2"
 
-_PROMPT = """Tu es un conseiller en orientation pour BTS SIO SISR.
+_PROMPT = """Tu es un assistant spécialisé dans la recherche d'alternance en développement web et infrastructure IT.
 {profil_context}
 
 Analyse cette entreprise et évalue son adéquation avec ce profil.
